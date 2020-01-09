@@ -14,7 +14,7 @@ func (sc *ScaleAlertAggregator) Subscribe(subscriber chan sokar.ScaleEvent) {
 func (sc *ScaleAlertAggregator) emitScaleEvent(scaleFactor float32) {
 
 	for _, subscriber := range sc.subscriptions {
-		subscriber <- sokar.ScaleEvent{ScaleFactor: scaleFactor}
+		subscriber <- sokar.NewScaleEvent(scaleFactor)
 	}
 }
 
@@ -98,10 +98,12 @@ func updateAlertMetrics(pool *ScaleAlertPool, metrics *Metrics) {
 }
 
 // Stop tears down ScaleAlertAggregator
-func (sc *ScaleAlertAggregator) Stop() {
+func (sc *ScaleAlertAggregator) Stop() error {
 	sc.logger.Info().Msg("Teardown requested")
 	// send the stop message
 	sc.stopChan <- struct{}{}
+
+	return nil
 }
 
 // Join blocks/ waits until ScaleAlertAggregator has been stopped

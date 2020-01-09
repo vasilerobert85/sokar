@@ -1,9 +1,36 @@
 # Changelog
 
-## v0.0.9 (2019-??-??)
+## v0.0.12 (2019-12-31)
+
+- Capacity Planning: With [#110](https://github.com/ThomasObenaus/sokar/issues/110) the new feature **Scheduled Scaling** was added to sokar. For more details read [ScheduledScaling.md](doc/ScheduledScaling.md).
+
+## v0.0.11 (2019-11-03)
+
+- BugFixes:
+  - [#106 Downscaling of AWS instances fails (Throttling: Rate exceeded)](https://github.com/ThomasObenaus/sokar/issues/106)
+  - [#108 Instance Downscaling does not complete](https://github.com/ThomasObenaus/sokar/issues/108)
+- Config: With [#108](https://github.com/ThomasObenaus/sokar/issues/108) the new configuration parameter `instance-termination-timeout` was introduced.
+
+## v0.0.10 (2019-10-13)
+
+- Config: With [#103](https://github.com/ThomasObenaus/sokar/issues/103) the deprecated parameter `sca.nomad.mode` was removed. That parameter was replaced by `sca.mode` in a previous release.
+- Build: With [#99](https://github.com/ThomasObenaus/sokar/issues/99) sokar is build based on golang 1.13.1 and the docker image is based on alpine 3.10.
+- With [#98](https://github.com/ThomasObenaus/sokar/issues/98) sokar won't modify any scaleObject automatically any more. Now the ScaleObjectWatcher is disabled in dry-run mode. For more information about dry-run mode see [DryRunMode.md](doc/DryRunMode.md).
+- Refactor: With [#95](https://github.com/ThomasObenaus/sokar/issues/95) the code was refactored to use the functional option approach instead of config structs.
+
+## v0.0.9 (2019-09-24)
+
+- With [#90](https://github.com/ThomasObenaus/sokar/issues/90) sokar gets a real downscaling for nomad workers running on AWS.
+- This means:
+  1.  The nomad worker with least running allocations, CPU and memory will be selected as candidate.
+  2.  This nomad worker will be drained.
+  3.  Then the according instance is terminated and the AWS ASG's desired capacity is reduced accordingly.
+- ScalingTarget: With [#92](https://github.com/ThomasObenaus/sokar/issues/92) sokar can scale up/ down AWS EC2 instances that are managed by an AWS AutoScalingGroup. Therefore the ASG just have to be tagged with `scale-object=<some_name>` and sokar has to run in scaler mode `aws-ec2` (`--sca.mode=aws-ec2`). Then if sokar is introduced to scale the scale-object `some_name` (`--scale-object.name=some_name`) he would adjust the number of instances created by this ASG based on the scaling alerts he gets.
+- Config: With [#92](https://github.com/ThomasObenaus/sokar/issues/92) the config parameter `--sca.nomad.mode` is deprecated and replaced by `--sca.mode`. Furthermore the possible values for this parameter are now: `nomad-job` instead of `job`, `nomad-dc` instead of `dc` and `aws-ec2`. The old values `job` and `dc` are deprecated.
 - Config: With [#88](https://github.com/ThomasObenaus/sokar/issues/88) the interval sokar checks if someone externally (e.g. a deplyoment) has changed the scale of the scale-object is now configurable (`--sca.watcher-interval`).
 
 ## v0.0.8 (2019-09-12)
+
 - Fix: With [#86](https://github.com/ThomasObenaus/sokar/issues/86) the issue that the scale watchers desired scale value could be changed unwanted due to side-effects was fixed.
 - Config: Removed deprecated/ unused config-parmeters:
   - `--mode` was replaced by `--sca.nomad.mode`
@@ -12,7 +39,7 @@
 
 ## v0.0.7 (2019-06-10)
 
-- CapacityPlanner: With [#49](https://github.com/ThomasObenaus/sokar/issues/49), beside the constant mode, a new mode for the CapacityPlanner, the linear mode, was added. Per default, the constant mode will be still used though. For more details see [CapacityPlanner](capacityPlanner/README.md).
+- CapacityPlanner: With [#49](https://github.com/ThomasObenaus/sokar/issues/49), beside the constant mode, a new mode for the CapacityPlanner, the linear mode, was added. Per default, the constant mode will be still used though. For more details see [CapacityPlanner](capacityplanner/README.md).
 - Config: With [#68](https://github.com/ThomasObenaus/sokar/issues/68) two new config parameters for scaling a nomad data-center on AWS where added. These parameters are:
   - `--sca.nomad.dc-aws.profile`
   - `--sca.nomad.dc-aws.region`

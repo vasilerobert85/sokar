@@ -2,10 +2,13 @@ package nomadWorker
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/aws/aws-sdk-go/aws/session"
+	nomadApi "github.com/hashicorp/nomad/api"
 	"github.com/rs/zerolog"
-	iface "github.com/thomasobenaus/sokar/nomadWorker/iface"
+	"github.com/thomasobenaus/sokar/aws"
+	iface "github.com/thomasobenaus/sokar/aws/iface"
 )
 
 // Connector is a object that allows to interact with nomad worker
@@ -36,39 +39,99 @@ type Connector struct {
 
 	// awsRegion is the region where the datacenter to be scaled is located in.
 	awsRegion string
+
+	// Interface that is used to interact with nomad nodes
+	nodesIF Nodes
+
+	// nodeDrainDeadline the maximum amount of time nomad will wait before the containers will be forced to be moved
+	nodeDrainDeadline time.Duration
+
+	// instanceTerminationTimeout is the timeout used to monitor the scale of an aws instance at maximum
+	instanceTerminationTimeout time.Duration
 }
 
-// Config contains the main configuration for the nomad worker connector
-type Config struct {
-	Logger zerolog.Logger
+// Option represents an option for the nomadWorker Connector
+type Option func(c *Connector)
 
-	// AWSProfile represents the name of the aws profile that shall be used to access the resources to scale the data-center.
-	// This parameter is optional. If it is empty the instance where sokar runs on has to have enough permissions to access the
-	// resources (ASG) for scaling. In this case the AWSRegion parameter has to be specified as well.
-	AWSProfile string
-
-	// AWSRegion is an optional parameter and is regarded only if the parameter AWSProfile is empty.
-	// The AWSRegion has to specify the region in which the data-center to be scaled resides in.
-	AWSRegion string
+// WithLogger adds a configured Logger to the nomadWorker Connector
+func WithLogger(logger zerolog.Logger) Option {
+	return func(c *Connector) {
+		c.log = logger
+	}
 }
 
-// New creates a new nomad connector
-func (cfg *Config) New() (*Connector, error) {
+// WithAwsRegion sets the aws region in which the resource to be scaled can be found
+func WithAwsRegion(region string) Option {
+	return func(c *Connector) {
+		c.awsRegion = region
+	}
+}
 
-	if len(cfg.AWSProfile) == 0 && len(cfg.AWSRegion) == 0 {
-		return nil, fmt.Errorf("The parameters AWSRegion and AWSProfile are empty")
+// TimeoutForInstanceTermination sets the maximum time the instance termination will be monitored before assuming that this action failed.
+func TimeoutForInstanceTermination(timeout time.Duration) Option {
+	return func(c *Connector) {
+		c.instanceTerminationTimeout = timeout
+	}
+}
+
+// New creates a new nomad worker connector.
+// The profile represents the name of the aws profile that shall be used to access the resources to scale the aws AutoScalingGroup.
+// This parameter is optional. If the profile is NOT set the instance where sokar runs on has to have enough permissions to access the
+// resources (ASG) for scaling (e.g. granted by a AWS Instance Profile). In this case the region parameter has to be specified instead (via WithAwsRegion()).
+func New(nomadServerAddress, awsProfile string, options ...Option) (*Connector, error) {
+	if len(nomadServerAddress) == 0 {
+		return nil, fmt.Errorf("required configuration 'nomadServerAddress' is missing/ empty")
 	}
 
-	nc := &Connector{
-		log:                        cfg.Logger,
+	nomadConn := Connector{
 		tagKey:                     "datacenter",
-		autoScalingFactory:         &autoScalingFactoryImpl{},
-		fnCreateSession:            newAWSSession,
-		fnCreateSessionFromProfile: newAWSSessionFromProfile,
-		awsProfile:                 cfg.AWSProfile,
-		awsRegion:                  cfg.AWSRegion,
+		autoScalingFactory:         &aws.AutoScalingFactoryImpl{},
+		fnCreateSession:            aws.NewAWSSession,
+		fnCreateSessionFromProfile: aws.NewAWSSessionFromProfile,
+		nodeDrainDeadline:          time.Second * 60,
+		instanceTerminationTimeout: time.Minute * 10,
+		awsProfile:                 awsProfile,
 	}
 
-	cfg.Logger.Info().Msg("Setting up nomad worker connector ... done")
-	return nc, nil
+	// config needed to set up a nomad api client
+	config := nomadApi.DefaultConfig()
+	config.Address = nomadServerAddress
+	//config.SecretID = token
+	//config.TLSConfig.TLSServerName = tls_server_name
+
+	client, err := nomadApi.NewClient(config)
+	if err != nil {
+		return nil, err
+	}
+	nomadConn.nodesIF = client.Nodes()
+
+	// apply the options
+	for _, opt := range options {
+		opt(&nomadConn)
+	}
+
+	nomadConn.log.Info().Str("srvAddr", nomadServerAddress).Str("awsProfile", nomadConn.awsProfile).Str("awsRegion", nomadConn.awsRegion).Msg("Setting up nomad worker connector ...")
+
+	if err := validate(nomadConn); err != nil {
+		return nil, err
+	}
+
+	nomadConn.log.Info().Msg("Setting up nomad worker connector ... done")
+	return &nomadConn, nil
+}
+
+func (c *Connector) String() string {
+	return "Nomad-DC (Nomad DataCenter, on AWS)"
+}
+
+func validate(c Connector) error {
+
+	if len(c.tagKey) == 0 {
+		return fmt.Errorf("the tagkey to identify the AutoScalingGroup that should be scaled is not specified")
+	}
+	if len(c.awsProfile) == 0 && len(c.awsRegion) == 0 {
+		return fmt.Errorf("aws profile and region are not specified")
+	}
+
+	return nil
 }

@@ -10,7 +10,8 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/thomasobenaus/sokar/alertmanager"
 	"github.com/thomasobenaus/sokar/api"
-	"github.com/thomasobenaus/sokar/capacityPlanner"
+	"github.com/thomasobenaus/sokar/awsEc2"
+	"github.com/thomasobenaus/sokar/capacityplanner"
 	"github.com/thomasobenaus/sokar/config"
 	"github.com/thomasobenaus/sokar/helper"
 	"github.com/thomasobenaus/sokar/logging"
@@ -18,6 +19,7 @@ import (
 	"github.com/thomasobenaus/sokar/nomadWorker"
 	"github.com/thomasobenaus/sokar/scaleAlertAggregator"
 	"github.com/thomasobenaus/sokar/scaler"
+	"github.com/thomasobenaus/sokar/scaleschedule"
 	"github.com/thomasobenaus/sokar/sokar"
 	sokarIF "github.com/thomasobenaus/sokar/sokar/iface"
 
@@ -49,40 +51,44 @@ func main() {
 	logger.Info().Msg("Connecting components and setting up sokar")
 
 	logger.Info().Msg("1. Setup: API")
-	api := api.New(cfg.Port, loggingFactory.NewNamedLogger("sokar.api"))
+	api := api.New(cfg.Port, api.WithLogger(loggingFactory.NewNamedLogger("sokar.api")))
 
-	logger.Info().Msg("2. Setup: ScaleAlertEmitters")
+	logger.Info().Msg("2. Setup: ScaleSchedule")
+	schedule := helper.Must(setupSchedule(cfg, logger)).(*scaleschedule.Schedule)
+
+	logger.Info().Msg("3. Setup: ScaleAlertEmitters")
 	scaleAlertEmitters := helper.Must(setupScaleAlertEmitters(api, loggingFactory)).([]scaleAlertAggregator.ScaleAlertEmitter)
 
-	logger.Info().Msg("3. Setup: ScaleAlertAggregator")
+	logger.Info().Msg("4. Setup: ScaleAlertAggregator")
 	scaAlertAggr := setupScaleAlertAggregator(scaleAlertEmitters, cfg, loggingFactory)
 
-	logger.Info().Msg("4. Setup: Scaler")
+	logger.Info().Msg("5. Setup: Scaling Target")
 	scalingTarget := helper.Must(setupScalingTarget(cfg.Scaler, loggingFactory)).(scaler.ScalingTarget)
+	logger.Info().Msgf("Scaling Target: %s", scalingTarget.String())
 
-	scaler := helper.Must(setupScaler(cfg.ScaleObject.Name, cfg.ScaleObject.MinCount, cfg.ScaleObject.MaxCount, cfg.Scaler.WatcherInterval, scalingTarget, loggingFactory)).(*scaler.Scaler)
+	logger.Info().Msg("6. Setup: Scaler")
+	scaler := helper.Must(setupScaler(cfg.ScaleObject.Name, cfg.ScaleObject.MinCount, cfg.ScaleObject.MaxCount, cfg.Scaler.WatcherInterval, scalingTarget, loggingFactory, cfg.DryRunMode)).(*scaler.Scaler)
 
-	logger.Info().Msg("5. Setup: CapacityPlanner")
+	logger.Info().Msg("7. Setup: CapacityPlanner")
 
-	var constantMode *capacityPlanner.ConstantMode
-	var linearMode *capacityPlanner.LinearMode
+	var mode capacityplanner.Option
 	if cfg.CapacityPlanner.ConstantMode.Enable {
-		constantMode = &capacityPlanner.ConstantMode{Offset: cfg.CapacityPlanner.ConstantMode.Offset}
+		mode = capacityplanner.UseConstantMode(cfg.CapacityPlanner.ConstantMode.Offset)
 	} else if cfg.CapacityPlanner.LinearMode.Enable {
-		linearMode = &capacityPlanner.LinearMode{ScaleFactorWeight: float32(cfg.CapacityPlanner.LinearMode.ScaleFactorWeight)}
+		mode = capacityplanner.UseLinearMode(float32(cfg.CapacityPlanner.LinearMode.ScaleFactorWeight))
 	}
 
-	capaCfg := capacityPlanner.Config{
-		Logger:                  loggingFactory.NewNamedLogger("sokar.capaPlanner"),
-		DownScaleCooldownPeriod: cfg.CapacityPlanner.DownScaleCooldownPeriod,
-		UpScaleCooldownPeriod:   cfg.CapacityPlanner.UpScaleCooldownPeriod,
-		ConstantMode:            constantMode,
-		LinearMode:              linearMode,
-	}
-	capaPlanner := helper.Must(capaCfg.New()).(*capacityPlanner.CapacityPlanner)
+	capaPlanner := helper.Must(capacityplanner.New(
+		capacityplanner.NewMetrics(),
+		capacityplanner.WithLogger(loggingFactory.NewNamedLogger("sokar.capaPlanner")),
+		capacityplanner.WithDownScaleCooldown(cfg.CapacityPlanner.DownScaleCooldownPeriod),
+		capacityplanner.WithUpScaleCooldown(cfg.CapacityPlanner.UpScaleCooldownPeriod),
+		capacityplanner.Schedule(schedule),
+		mode,
+	)).(*capacityplanner.CapacityPlanner)
 
-	logger.Info().Msg("6. Setup: Sokar")
-	sokarInst := helper.Must(setupSokar(scaAlertAggr, capaPlanner, scaler, api, logger, cfg.DryRunMode)).(*sokar.Sokar)
+	logger.Info().Msg("8. Setup: Sokar")
+	sokarInst := helper.Must(setupSokar(scaAlertAggr, capaPlanner, scaler, schedule, api, logger, cfg.DryRunMode)).(*sokar.Sokar)
 
 	// Register metrics handler
 	api.Router.Handler("GET", sokar.PathMetrics, promhttp.Handler())
@@ -141,13 +147,8 @@ func setupLogging(cfg *config.Config) (logging.LoggerFactory, error) {
 	if cfg == nil {
 		return nil, fmt.Errorf("Error creating LoggerFactory: Config is nil")
 	}
-	lCfg := logging.Config{
-		UseStructuredLogging:       cfg.Logging.Structured,
-		UseUnixTimestampForLogging: cfg.Logging.UxTimestamp,
-		NoColoredLogOutput:         cfg.Logging.NoColoredLogOutput,
-	}
 
-	loggingFactory := lCfg.New()
+	loggingFactory := logging.New(cfg.Logging.Structured, cfg.Logging.UxTimestamp, cfg.Logging.NoColoredLogOutput)
 	return loggingFactory, nil
 }
 
@@ -180,28 +181,24 @@ func setupScaleAlertEmitters(api *api.API, logF logging.LoggerFactory) ([]scaleA
 	if logF == nil {
 		return nil, fmt.Errorf("LoggingFactory is nil")
 	}
+	var scaleAlertEmitters []scaleAlertAggregator.ScaleAlertEmitter
 
 	// Alertmanger Connector
 	logger := logF.NewNamedLogger("sokar.alertmanager")
-	amCfg := alertmanager.Config{
-		Logger: logger,
-	}
-	amConnector := amCfg.New()
+	amConnector := alertmanager.New(alertmanager.WithLogger(logger))
 	api.Router.POST(sokar.PathAlertmanager, amConnector.HandleScaleAlerts)
 	logger.Info().Msgf("Connector for alerts from prometheus/alertmanager setup successfully. Will listen for alerts on %s", sokar.PathAlertmanager)
-
-	var scaleAlertEmitters []scaleAlertAggregator.ScaleAlertEmitter
 	scaleAlertEmitters = append(scaleAlertEmitters, amConnector)
 
 	return scaleAlertEmitters, nil
 }
 
-func setupSokar(scaleEventEmitter sokarIF.ScaleEventEmitter, capacityPlanner sokarIF.CapacityPlanner, scaler sokarIF.Scaler, api *api.API, logger zerolog.Logger, dryRunMode bool) (*sokar.Sokar, error) {
+func setupSokar(scaleEventEmitter sokarIF.ScaleEventEmitter, capacityPlanner sokarIF.CapacityPlanner, scaler sokarIF.Scaler, schedule sokarIF.ScaleSchedule, api *api.API, logger zerolog.Logger, dryRunMode bool) (*sokar.Sokar, error) {
 	cfg := sokar.Config{
 		Logger:     logger,
 		DryRunMode: dryRunMode,
 	}
-	sokarInst, err := cfg.New(scaleEventEmitter, capacityPlanner, scaler, sokar.NewMetrics())
+	sokarInst, err := cfg.New(scaleEventEmitter, capacityPlanner, scaler, schedule, sokar.NewMetrics())
 	if err != nil {
 		return nil, err
 	}
@@ -229,17 +226,34 @@ func setupScalingTarget(cfg config.Scaler, logF logging.LoggerFactory) (scaler.S
 
 	var scalingTarget scaler.ScalingTarget
 
-	if cfg.Nomad.Mode == config.ScalerModeDataCenter {
-		cfg := nomadWorker.Config{Logger: logF.NewNamedLogger("sokar.nomadWorker"), AWSRegion: cfg.Nomad.DataCenterAWS.Region, AWSProfile: cfg.Nomad.DataCenterAWS.Profile}
-		nomadWorker, err := cfg.New()
+	if cfg.Mode == config.ScalerModeNomadDataCenter {
+		nomadWorker, err := nomadWorker.New(
+			cfg.Nomad.ServerAddr,
+			cfg.Nomad.DataCenterAWS.Profile,
+			nomadWorker.WithLogger(logF.NewNamedLogger("sokar.nomadWorker")),
+			nomadWorker.WithAwsRegion(cfg.Nomad.DataCenterAWS.Region),
+			nomadWorker.TimeoutForInstanceTermination(cfg.Nomad.DataCenterAWS.InstanceTerminationTimeout),
+		)
 		if err != nil {
 			return nil, fmt.Errorf("Failed setting up nomad worker connector: %s", err)
 		}
 		scalingTarget = nomadWorker
+	} else if cfg.Mode == config.ScalerModeAwsEc2 {
+		awsEc2, err := awsEc2.New(
+			cfg.AwsEc2.ASGTagKey,
+			cfg.AwsEc2.Profile,
+			awsEc2.WithLogger(logF.NewNamedLogger("sokar.aws-ec2")),
+			awsEc2.WithAwsRegion(cfg.AwsEc2.Region),
+		)
+		if err != nil {
+			return nil, fmt.Errorf("Failed setting up aws-ec2 connector: %s", err)
+		}
+		scalingTarget = awsEc2
 	} else {
-		nomadConfig := nomad.NewDefaultConfig(cfg.Nomad.ServerAddr)
-		nomadConfig.Logger = logF.NewNamedLogger("sokar.nomad")
-		nomad, err := nomadConfig.New()
+		nomad, err := nomad.New(
+			cfg.Nomad.ServerAddr,
+			nomad.WithLogger(logF.NewNamedLogger("sokar.nomad")),
+		)
 		if err != nil {
 			return nil, fmt.Errorf("Failed setting up nomad connector: %s", err)
 		}
@@ -251,7 +265,7 @@ func setupScalingTarget(cfg config.Scaler, logF logging.LoggerFactory) (scaler.S
 }
 
 // setupScaler creates and configures the Scaler. Internally nomad is used as scaling target.
-func setupScaler(scalingObjName string, min uint, max uint, watcherInterval time.Duration, scalingTarget scaler.ScalingTarget, logF logging.LoggerFactory) (*scaler.Scaler, error) {
+func setupScaler(scalingObjName string, min uint, max uint, watcherInterval time.Duration, scalingTarget scaler.ScalingTarget, logF logging.LoggerFactory, dryRunMode bool) (*scaler.Scaler, error) {
 
 	if logF == nil {
 		return nil, fmt.Errorf("Logging factory is nil")
@@ -261,18 +275,49 @@ func setupScaler(scalingObjName string, min uint, max uint, watcherInterval time
 		return nil, fmt.Errorf("ScalingTarget is nil")
 	}
 
-	scaCfg := scaler.Config{
-		Name:            scalingObjName,
-		MinCount:        min,
-		MaxCount:        max,
-		Logger:          logF.NewNamedLogger("sokar.scaler"),
-		WatcherInterval: watcherInterval,
-	}
-
-	scaler, err := scaCfg.New(scalingTarget, scaler.NewMetrics())
+	scalingObject := scaler.ScalingObject{Name: scalingObjName, MinCount: min, MaxCount: max}
+	scaler, err := scaler.New(
+		scalingTarget,
+		scalingObject,
+		scaler.NewMetrics(),
+		scaler.WithLogger(logF.NewNamedLogger("sokar.scaler")),
+		scaler.WatcherInterval(watcherInterval),
+		scaler.DryRunMode(dryRunMode),
+	)
 	if err != nil {
 		return nil, fmt.Errorf("Failed setting up scaler: %s", err)
 	}
 
 	return scaler, nil
+}
+
+// TODO: Add endpoint to provide schedule
+func setupSchedule(cfg *config.Config, logger zerolog.Logger) (*scaleschedule.Schedule, error) {
+
+	if cfg == nil {
+		return nil, fmt.Errorf("Config is nil")
+	}
+
+	scaleSchedule := scaleschedule.New()
+	for _, entry := range cfg.CapacityPlanner.ScaleSchedule {
+		for _, day := range entry.Days {
+			minScale := uint(entry.MinScale)
+			maxScale := uint(entry.MaxScale)
+			if entry.MinScale < 0 {
+				minScale = 0
+			}
+
+			if entry.MaxScale < 0 {
+				maxScale = helper.MaxUint
+			}
+			if err := scaleSchedule.Insert(day, entry.StartTime, entry.EndTime, minScale, maxScale); err != nil {
+				logger.Warn().Msgf("Entry '%s' was not added to scale schedule for %s: %s", entry, day, err.Error())
+			} else {
+				logger.Debug().Msgf("Entry to scale schedule added: On %s at %s to %s -> [%d,%d]", day, entry.StartTime, entry.EndTime, minScale, maxScale)
+			}
+		}
+
+	}
+
+	return &scaleSchedule, nil
 }

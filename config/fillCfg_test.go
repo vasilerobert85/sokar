@@ -30,23 +30,33 @@ func Test_FillCfg_Flags(t *testing.T) {
 		"--saa.eval-period-factor=105",
 		"--saa.scale-alerts=alert 1:1.2:This is an upscaling alert",
 		"--saa.alert-expiration-time=5m",
-		"--sca.nomad.mode=dc",
+		"--sca.mode=aws-ec2",
 		"--sca.nomad.server-address=http://nomad",
 		"--sca.nomad.dc-aws.region=region-test",
 		"--sca.nomad.dc-aws.profile=profile-test",
+		"--sca.aws-ec2.profile=profile-test",
+		"--sca.aws-ec2.region=region-test",
+		"--sca.aws-ec2.asg-tag-key=asg-tag-key",
+		"--sca.aws-ec2.asg-tag-key=asg-tag-key",
+		"--sca.nomad.dc-aws.instance-termination-timeout=124s",
 		"--sca.watcher-interval=50s",
 		"--cap.constant-mode.enable=false",
 		"--cap.constant-mode.offset=106",
 		"--cap.linear-mode.enable=true",
 		"--cap.linear-mode.scale-factor-weight=0.107",
+		"--cap.scale-schedule=MON-FRI 7 9 10-30|WED-SAT 13:15 17:25 2-22",
 	}
 
 	err := cfg.ReadConfig(args)
 	assert.NoError(t, err)
-	assert.Equal(t, ScalerModeDataCenter, cfg.Scaler.Nomad.Mode)
+	assert.Equal(t, ScalerModeAwsEc2, cfg.Scaler.Mode)
 	assert.Equal(t, "profile-test", cfg.Scaler.Nomad.DataCenterAWS.Profile)
 	assert.Equal(t, "region-test", cfg.Scaler.Nomad.DataCenterAWS.Region)
+	assert.Equal(t, time.Duration(time.Second*124), cfg.Scaler.Nomad.DataCenterAWS.InstanceTerminationTimeout)
 	assert.Equal(t, "http://nomad", cfg.Scaler.Nomad.ServerAddr)
+	assert.Equal(t, "profile-test", cfg.Scaler.AwsEc2.Profile)
+	assert.Equal(t, "region-test", cfg.Scaler.AwsEc2.Region)
+	assert.Equal(t, "asg-tag-key", cfg.Scaler.AwsEc2.ASGTagKey)
 	assert.Equal(t, time.Duration(time.Second*50), cfg.Scaler.WatcherInterval)
 	assert.True(t, cfg.DryRunMode)
 	assert.Equal(t, 1000, cfg.Port)
@@ -73,8 +83,90 @@ func Test_FillCfg_Flags(t *testing.T) {
 	assert.Equal(t, uint(106), cfg.CapacityPlanner.ConstantMode.Offset)
 	assert.True(t, cfg.CapacityPlanner.LinearMode.Enable)
 	assert.Equal(t, float64(0.107), cfg.CapacityPlanner.LinearMode.ScaleFactorWeight)
+
+	require.NotNil(t, cfg.CapacityPlanner.ScaleSchedule)
+	require.Len(t, cfg.CapacityPlanner.ScaleSchedule, 2)
+	assert.Len(t, cfg.CapacityPlanner.ScaleSchedule[0].Days, 5)
+	assert.Equal(t, uint(7), cfg.CapacityPlanner.ScaleSchedule[0].StartTime.Hour)
+	assert.Equal(t, uint(0), cfg.CapacityPlanner.ScaleSchedule[0].StartTime.Minute)
+	assert.Equal(t, uint(9), cfg.CapacityPlanner.ScaleSchedule[0].EndTime.Hour)
+	assert.Equal(t, uint(0), cfg.CapacityPlanner.ScaleSchedule[0].EndTime.Minute)
+	assert.Equal(t, 10, cfg.CapacityPlanner.ScaleSchedule[0].MinScale)
+	assert.Equal(t, 30, cfg.CapacityPlanner.ScaleSchedule[0].MaxScale)
+	assert.Len(t, cfg.CapacityPlanner.ScaleSchedule[1].Days, 4)
+	assert.Equal(t, uint(13), cfg.CapacityPlanner.ScaleSchedule[1].StartTime.Hour)
+	assert.Equal(t, uint(15), cfg.CapacityPlanner.ScaleSchedule[1].StartTime.Minute)
+	assert.Equal(t, uint(17), cfg.CapacityPlanner.ScaleSchedule[1].EndTime.Hour)
+	assert.Equal(t, uint(25), cfg.CapacityPlanner.ScaleSchedule[1].EndTime.Minute)
+	assert.Equal(t, 2, cfg.CapacityPlanner.ScaleSchedule[1].MinScale)
+	assert.Equal(t, 22, cfg.CapacityPlanner.ScaleSchedule[1].MaxScale)
 }
 
+func Test_ValidateScaler_NomadJob(t *testing.T) {
+	sca := Scaler{}
+	err := validateScaler(sca)
+	assert.Error(t, err)
+
+	sca = Scaler{Mode: ScalerModeNomadJob}
+	err = validateScaler(sca)
+	assert.Error(t, err)
+
+	sca = Scaler{Mode: ScalerModeNomadJob, Nomad: SCANomad{ServerAddr: "http://test.com"}, WatcherInterval: time.Millisecond * 499}
+	err = validateScaler(sca)
+	assert.Error(t, err)
+
+	sca = Scaler{Mode: ScalerModeNomadJob, Nomad: SCANomad{ServerAddr: "http://test.com"}, WatcherInterval: time.Second * 5}
+	err = validateScaler(sca)
+	assert.NoError(t, err)
+}
+
+func Test_ValidateScaler_AwsEc2(t *testing.T) {
+	sca := Scaler{}
+	err := validateScaler(sca)
+	assert.Error(t, err)
+
+	sca = Scaler{Mode: ScalerModeAwsEc2}
+	err = validateScaler(sca)
+	assert.Error(t, err)
+
+	sca = Scaler{Mode: ScalerModeAwsEc2, AwsEc2: SCAAwsEc2{Profile: "profile"}}
+	err = validateScaler(sca)
+	assert.Error(t, err)
+
+	sca = Scaler{Mode: ScalerModeAwsEc2, AwsEc2: SCAAwsEc2{Profile: "profile", Region: "test-region"}}
+	err = validateScaler(sca)
+	assert.Error(t, err)
+
+	sca = Scaler{Mode: ScalerModeAwsEc2, AwsEc2: SCAAwsEc2{Profile: "profile", ASGTagKey: "datacenter"}}
+	err = validateScaler(sca)
+	assert.Error(t, err)
+
+	sca = Scaler{Mode: ScalerModeAwsEc2, AwsEc2: SCAAwsEc2{Profile: "profile", ASGTagKey: "datacenter"}, WatcherInterval: time.Second * 2}
+	err = validateScaler(sca)
+	assert.NoError(t, err)
+}
+
+func Test_ValidateScaler_NomadDatacenter(t *testing.T) {
+	sca := Scaler{}
+	err := validateScaler(sca)
+	assert.Error(t, err)
+
+	sca = Scaler{Mode: ScalerModeNomadDataCenter}
+	err = validateScaler(sca)
+	assert.Error(t, err)
+
+	sca = Scaler{Mode: ScalerModeNomadDataCenter, Nomad: SCANomad{ServerAddr: "http://test.com"}}
+	err = validateScaler(sca)
+	assert.Error(t, err)
+
+	sca = Scaler{Mode: ScalerModeNomadDataCenter, Nomad: SCANomad{ServerAddr: "http://test.com", DataCenterAWS: SCANomadDataCenterAWS{Profile: "profile"}}}
+	err = validateScaler(sca)
+	assert.Error(t, err)
+
+	sca = Scaler{Mode: ScalerModeNomadDataCenter, WatcherInterval: time.Second * 2, Nomad: SCANomad{ServerAddr: "http://test.com", DataCenterAWS: SCANomadDataCenterAWS{Profile: "profile"}}}
+	err = validateScaler(sca)
+	assert.NoError(t, err)
+}
 func Test_AlertMapToAlerts(t *testing.T) {
 
 	alerts, err := alertMapToAlerts(nil)
@@ -218,9 +310,214 @@ func Test_StrToScalerMode(t *testing.T) {
 
 	mode, err = strToScalerMode("JOB")
 	assert.NoError(t, err)
-	assert.Equal(t, ScalerModeJob, mode)
+	assert.Equal(t, ScalerModeNomadJob, mode)
 
 	mode, err = strToScalerMode("Dc")
 	assert.NoError(t, err)
-	assert.Equal(t, ScalerModeDataCenter, mode)
+	assert.Equal(t, ScalerModeNomadDataCenter, mode)
+
+	mode, err = strToScalerMode("aws-eC2")
+	assert.NoError(t, err)
+	assert.Equal(t, ScalerModeAwsEc2, mode)
+}
+
+func Test_ValidateCapacityPlanner(t *testing.T) {
+	capacityPlanner := CapacityPlanner{}
+	err := validateCapacityPlanner(capacityPlanner)
+	assert.Error(t, err)
+
+	capacityPlanner = CapacityPlanner{ConstantMode: CAPConstMode{Enable: true}, LinearMode: CAPLinearMode{Enable: true}}
+	err = validateCapacityPlanner(capacityPlanner)
+	assert.Error(t, err)
+
+	capacityPlanner = CapacityPlanner{LinearMode: CAPLinearMode{Enable: true, ScaleFactorWeight: 0}}
+	err = validateCapacityPlanner(capacityPlanner)
+	assert.Error(t, err)
+
+	capacityPlanner = CapacityPlanner{ConstantMode: CAPConstMode{Enable: true, Offset: 0}}
+	err = validateCapacityPlanner(capacityPlanner)
+	assert.Error(t, err)
+
+	capacityPlanner = CapacityPlanner{LinearMode: CAPLinearMode{Enable: true, ScaleFactorWeight: 0.5}}
+	err = validateCapacityPlanner(capacityPlanner)
+	assert.NoError(t, err)
+
+	capacityPlanner = CapacityPlanner{ConstantMode: CAPConstMode{Enable: true, Offset: 1}}
+	err = validateCapacityPlanner(capacityPlanner)
+	assert.NoError(t, err)
+
+	// success - no schedule
+	scaleSchedule := make([]ScaleScheduleEntry, 0)
+	capacityPlanner = CapacityPlanner{ConstantMode: CAPConstMode{Enable: true, Offset: 1}, ScaleSchedule: scaleSchedule}
+	err = validateCapacityPlanner(capacityPlanner)
+	assert.NoError(t, err)
+}
+
+func Test_ExtractScaleScheduleFromViper(t *testing.T) {
+
+	vp := viper.New()
+	scaleScheduleEntries, err := extractScaleScheduleFromViper(vp)
+	assert.Empty(t, scaleScheduleEntries)
+	assert.NoError(t, err)
+
+	// Success - commandline
+	vp.Set(capScaleSchedule.name, "MON-FRI 7 9 10-30|WED-SAT 13:15 17:25 2-*")
+	scaleScheduleEntries, err = extractScaleScheduleFromViper(vp)
+	assert.NotEmpty(t, scaleScheduleEntries)
+	assert.NoError(t, err)
+	assert.Len(t, scaleScheduleEntries, 2)
+	assert.Len(t, scaleScheduleEntries[0].Days, 5)
+	assert.Equal(t, uint(7), scaleScheduleEntries[0].StartTime.Hour)
+	assert.Equal(t, uint(0), scaleScheduleEntries[0].StartTime.Minute)
+	assert.Equal(t, uint(9), scaleScheduleEntries[0].EndTime.Hour)
+	assert.Equal(t, uint(0), scaleScheduleEntries[0].EndTime.Minute)
+	assert.Equal(t, 10, scaleScheduleEntries[0].MinScale)
+	assert.Equal(t, 30, scaleScheduleEntries[0].MaxScale)
+	assert.Len(t, scaleScheduleEntries[1].Days, 4)
+	assert.Equal(t, uint(13), scaleScheduleEntries[1].StartTime.Hour)
+	assert.Equal(t, uint(15), scaleScheduleEntries[1].StartTime.Minute)
+	assert.Equal(t, uint(17), scaleScheduleEntries[1].EndTime.Hour)
+	assert.Equal(t, uint(25), scaleScheduleEntries[1].EndTime.Minute)
+	assert.Equal(t, 2, scaleScheduleEntries[1].MinScale)
+	assert.Equal(t, -1, scaleScheduleEntries[1].MaxScale)
+
+	// Success - config
+	entries := make([]map[string]string, 0)
+	entry := make(map[string]string, 0)
+	entry["days"] = "MON-FRI"
+	entry["start-time"] = "7:30"
+	entry["end-time"] = "9:30"
+	entry["min"] = "10"
+	entry["max"] = "30"
+	entries = append(entries, entry)
+
+	entry = make(map[string]string, 0)
+	entry["days"] = "SAT-SUN"
+	entry["start-time"] = "17"
+	entry["end-time"] = "18"
+	entry["min"] = "2"
+	entry["max"] = "3"
+	entries = append(entries, entry)
+
+	vp.Set(capScaleSchedule.name, entries)
+	scaleScheduleEntries, err = extractScaleScheduleFromViper(vp)
+	assert.NotEmpty(t, scaleScheduleEntries)
+	assert.NoError(t, err)
+	assert.Len(t, scaleScheduleEntries, 2)
+	assert.Len(t, scaleScheduleEntries[0].Days, 5)
+	assert.Equal(t, uint(7), scaleScheduleEntries[0].StartTime.Hour)
+	assert.Equal(t, uint(30), scaleScheduleEntries[0].StartTime.Minute)
+	assert.Equal(t, uint(9), scaleScheduleEntries[0].EndTime.Hour)
+	assert.Equal(t, uint(30), scaleScheduleEntries[0].EndTime.Minute)
+	assert.Equal(t, 10, scaleScheduleEntries[0].MinScale)
+	assert.Equal(t, 30, scaleScheduleEntries[0].MaxScale)
+	assert.Len(t, scaleScheduleEntries[1].Days, 2)
+	assert.Equal(t, uint(17), scaleScheduleEntries[1].StartTime.Hour)
+	assert.Equal(t, uint(0), scaleScheduleEntries[1].StartTime.Minute)
+	assert.Equal(t, uint(18), scaleScheduleEntries[1].EndTime.Hour)
+	assert.Equal(t, uint(0), scaleScheduleEntries[1].EndTime.Minute)
+	assert.Equal(t, 2, scaleScheduleEntries[1].MinScale)
+	assert.Equal(t, 3, scaleScheduleEntries[1].MaxScale)
+
+	// Fail - config - schedule
+	entries = make([]map[string]string, 0)
+	entry = make(map[string]string, 0)
+	entry["days"] = "invalid"
+	entries = append(entries, entry)
+	vp.Set(capScaleSchedule.name, entries)
+	scaleScheduleEntries, err = extractScaleScheduleFromViper(vp)
+	assert.Empty(t, scaleScheduleEntries)
+	assert.Error(t, err)
+	//
+	// Success - config - empty
+	vp.Set(capScaleSchedule.name, "")
+	scaleScheduleEntries, err = extractScaleScheduleFromViper(vp)
+	assert.Empty(t, scaleScheduleEntries)
+	assert.NoError(t, err)
+}
+
+func Test_ScaleScheduleMapToScaleSchedule(t *testing.T) {
+	// TODO: Reenable test
+	scaleScheduleEntries, err := scaleScheduleMapToScaleSchedule(nil)
+	assert.Nil(t, scaleScheduleEntries)
+	assert.Error(t, err)
+
+	// Success
+	entries := make([]map[string]string, 0)
+	entry := make(map[string]string, 0)
+	entry["days"] = "MON-FRI"
+	entry["start-time"] = "7:30"
+	entry["end-time"] = "9:30"
+	entry["min"] = "10"
+	entry["max"] = "30"
+	entries = append(entries, entry)
+	scaleScheduleEntries, err = scaleScheduleMapToScaleSchedule(entries)
+	assert.Len(t, scaleScheduleEntries[0].Days, 5)
+	assert.Equal(t, uint(7), scaleScheduleEntries[0].StartTime.Hour)
+	assert.Equal(t, uint(30), scaleScheduleEntries[0].StartTime.Minute)
+	assert.Equal(t, uint(9), scaleScheduleEntries[0].EndTime.Hour)
+	assert.Equal(t, uint(30), scaleScheduleEntries[0].EndTime.Minute)
+	assert.Equal(t, 10, scaleScheduleEntries[0].MinScale)
+	assert.Equal(t, 30, scaleScheduleEntries[0].MaxScale)
+
+	// Fail - config - days
+	entries = make([]map[string]string, 0)
+	entry = make(map[string]string, 0)
+	entry["days"] = "invalid"
+	entries = append(entries, entry)
+	scaleScheduleEntries, err = scaleScheduleMapToScaleSchedule(entries)
+	assert.Empty(t, scaleScheduleEntries)
+	assert.Error(t, err)
+
+	// Fail - config - min
+	entries = make([]map[string]string, 0)
+	entry = make(map[string]string, 0)
+	entry["days"] = "MON-FRI"
+	entry["start-time"] = "7:30"
+	entry["end-time"] = "9:30"
+	entry["min"] = "invalid"
+	entry["max"] = "30"
+	entries = append(entries, entry)
+	scaleScheduleEntries, err = scaleScheduleMapToScaleSchedule(entries)
+	assert.Empty(t, scaleScheduleEntries)
+	assert.Error(t, err)
+
+	// Fail - config - max
+	entries = make([]map[string]string, 0)
+	entry = make(map[string]string, 0)
+	entry["days"] = "MON-FRI"
+	entry["start-time"] = "7:30"
+	entry["end-time"] = "9:30"
+	entry["min"] = "10"
+	entry["max"] = "invalid"
+	entries = append(entries, entry)
+	scaleScheduleEntries, err = scaleScheduleMapToScaleSchedule(entries)
+	assert.Empty(t, scaleScheduleEntries)
+	assert.Error(t, err)
+
+	// Fail - config - start time empty
+	entries = make([]map[string]string, 0)
+	entry = make(map[string]string, 0)
+	entry["days"] = "MON-FRI"
+	entry["start-time"] = ""
+	entry["end-time"] = "9:30"
+	entry["min"] = "10"
+	entry["max"] = "30"
+	entries = append(entries, entry)
+	scaleScheduleEntries, err = scaleScheduleMapToScaleSchedule(entries)
+	assert.Empty(t, scaleScheduleEntries)
+	assert.Error(t, err)
+
+	// Fail - config - end time empty
+	entries = make([]map[string]string, 0)
+	entry = make(map[string]string, 0)
+	entry["days"] = "MON-FRI"
+	entry["start-time"] = "7:30"
+	entry["end-time"] = ""
+	entry["min"] = "10"
+	entry["max"] = "30"
+	entries = append(entries, entry)
+	scaleScheduleEntries, err = scaleScheduleMapToScaleSchedule(entries)
+	assert.Empty(t, scaleScheduleEntries)
+	assert.Error(t, err)
 }

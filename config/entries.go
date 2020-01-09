@@ -17,7 +17,8 @@ var dryRun = configEntry{
 	bindFlag:     true,
 	bindEnv:      true,
 	defaultValue: false,
-	usage:        "If true, then sokar won't execute the planned scaling action. Only scaling actions triggered via ScaleBy end-point will be executed.",
+	usage: "If true, then sokar won't execute the planned scaling action. Only scaling\n" +
+		"actions triggered via ScaleBy end-point will be executed.",
 }
 
 var port = configEntry{
@@ -29,12 +30,68 @@ var port = configEntry{
 }
 
 // ###################### Context: scaler ####################################################
+var scaMode = configEntry{
+	name:         "sca.mode",
+	bindEnv:      true,
+	bindFlag:     true,
+	defaultValue: "nomad-job",
+	usage: "Scaling target mode is either job based, instance-based or data-center\n" +
+		"(worker/ instance) based scaling. In data-center (dc) mode the nomad workers\n" +
+		"will be scaled. In job mode the number of allocations for this job will be adjusted.",
+}
+
+var scaWatcherInterval = configEntry{
+	name:         "sca.watcher-interval",
+	bindEnv:      true,
+	bindFlag:     true,
+	defaultValue: "5s",
+	usage: "The interval the Scaler will check if the scalingObject count still matches\n" +
+		"the desired state.",
+}
+
+// ###################### Context: scaler AWS EC2 ############################################
+var scaAWSEC2Profile = configEntry{
+	name:         "sca.aws-ec2.profile",
+	bindEnv:      true,
+	bindFlag:     true,
+	defaultValue: "",
+	usage: "This parameter represents the name of the aws profile that shall be used to\n" +
+		"access the resources to scale the data-center. This parameter is optional. If it\n" +
+		"is empty the instance where sokar runs on has to have enough permissions to access\n" +
+		"the resources (ASG) for scaling. In this case the AWSRegion parameter has to be\n" +
+		"specified as well.",
+}
+
+var scaAWSEC2Region = configEntry{
+	name:         "sca.aws-ec2.region",
+	bindEnv:      true,
+	bindFlag:     true,
+	defaultValue: "eu-central-1",
+	usage: "This is an optional parameter and is regarded only if the parameter\n" +
+		"AWSProfile is empty. The AWSRegion has to specify the region in which the\n" +
+		"data-center to be scaled resides in.",
+}
+
+var scaAWSEC2ASGTagKey = configEntry{
+	name:         "sca.aws-ec2.asg-tag-key",
+	bindEnv:      true,
+	bindFlag:     true,
+	defaultValue: "scale-object",
+	usage: "This parameter specifies which tag on an AWS AutoScalingGroup shall be used\n" +
+		"to find the ASG that should be automatically scaled.",
+}
+
+// ###################### Context: scaler Nomad ###############################################
 var scaNomadDataCenterAWSProfile = configEntry{
 	name:         "sca.nomad.dc-aws.profile",
 	bindEnv:      true,
 	bindFlag:     true,
 	defaultValue: "",
-	usage:        "This parameter represents the name of the aws profile that shall be used to access the resources to scale the data-center. This parameter is optional. If it is empty the instance where sokar runs on has to have enough permissions to access the resources (ASG) for scaling. In this case the AWSRegion parameter has to be specified as well.",
+	usage: "This parameter represents the name of the aws profile that shall be used to\n" +
+		"access the resources to scale the data-center. This parameter is optional. If it\n" +
+		"is empty the instance where sokar runs on has to have enough permissions to access\n" +
+		"the resources (ASG) for scaling. In this case the AWSRegion parameter has to be\n" +
+		"specified as well.",
 }
 
 var scaNomadDataCenterAWSRegion = configEntry{
@@ -42,15 +99,18 @@ var scaNomadDataCenterAWSRegion = configEntry{
 	bindEnv:      true,
 	bindFlag:     true,
 	defaultValue: "eu-central-1",
-	usage:        "This is an optional parameter and is regarded only if the parameter AWSProfile is empty. The AWSRegion has to specify the region in which the data-center to be scaled resides in.",
+	usage: "This is an optional parameter and is regarded only if the parameter\n" +
+		"AWSProfile is empty. The AWSRegion has to specify the region in which the data-center\n" +
+		"to be scaled resides in.",
 }
 
-var scaNomadMode = configEntry{
-	name:         "sca.nomad.mode",
+var scaNomadDataCenterAWSInstanceTerminationTimeout = configEntry{
+	name:         "sca.nomad.dc-aws.instance-termination-timeout",
 	bindEnv:      true,
 	bindFlag:     true,
-	defaultValue: "job",
-	usage:        "Scaling target mode is either job based or data-center (worker/ instance) based scaling. In data-center (dc) mode the nomad workers will be scaled. In job mode the number of allocations for this job will be adjusted.",
+	defaultValue: time.Minute * 10,
+	usage: "The maximum time the instance termination will be monitored before assuming\n" +
+		"that this action (instance termination due to downscale) failed.",
 }
 
 var scaNomadModeServerAddress = configEntry{
@@ -59,14 +119,6 @@ var scaNomadModeServerAddress = configEntry{
 	bindFlag:     true,
 	defaultValue: "",
 	usage:        "Specifies the address of the nomad server.",
-}
-
-var scaWatcherInterval = configEntry{
-	name:         "sca.watcher-interval",
-	bindEnv:      true,
-	bindFlag:     true,
-	defaultValue: "5s",
-	usage:        "The interval the Scaler will check if the scalingObject count still matches the desired state.",
 }
 
 // ###################### Context: scale-object ####################################################
@@ -95,6 +147,18 @@ var scaleObjectMax = configEntry{
 }
 
 // ###################### Context: CapacityPlanner#########################################
+var capScaleSchedule = configEntry{
+	name:         "cap.scale-schedule",
+	bindEnv:      true,
+	bindFlag:     true,
+	defaultValue: "",
+	usage: "Specifies time ranges within which it is ensured that the ScaleObject is scaled\n" +
+		"to at least min and not more than max. The min/ max values specified in this\n" +
+		"schedule have lower priority than the --scale-object.min/ --scale-object.max.\n" +
+		"This means the sokar will ensure that the --scale-object.min/ --scale-object.max\n" +
+		"are not violated no matter what is specified in the schedule.",
+}
+
 var capDownScaleCoolDown = configEntry{
 	name:         "cap.down-scale-cooldown",
 	bindEnv:      true,
@@ -116,7 +180,8 @@ var capConstantModeEnable = configEntry{
 	bindEnv:      true,
 	bindFlag:     true,
 	defaultValue: true,
-	usage:        "Enable/ disable the constant mode of the CapacityPlanner. Only one of the modes can be enabled at the same time.",
+	usage: "Enable/ disable the constant mode of the CapacityPlanner. Only one of the\n" +
+		"modes can be enabled at the same time.",
 }
 
 var capConstantModeOffset = configEntry{
@@ -124,7 +189,8 @@ var capConstantModeOffset = configEntry{
 	bindEnv:      true,
 	bindFlag:     true,
 	defaultValue: uint(1),
-	usage:        "The constant offset value that should be used to increment/ decrement the count of the scale-object. Only values > 0 are valid.",
+	usage: "The constant offset value that should be used to increment/ decrement the\n" +
+		"count of the scale-object. Only values > 0 are valid.",
 }
 
 var capLinearModeEnable = configEntry{
@@ -132,7 +198,8 @@ var capLinearModeEnable = configEntry{
 	bindEnv:      true,
 	bindFlag:     true,
 	defaultValue: false,
-	usage:        "Enable/ disable the linear mode of the CapacityPlanner. Only one of the modes can be enabled at the same time.",
+	usage: "Enable/ disable the linear mode of the CapacityPlanner. Only one of the modes\n" +
+		"can be enabled at the same time.",
 }
 
 var capLinearModeScaleFactorWeight = configEntry{
@@ -140,7 +207,8 @@ var capLinearModeScaleFactorWeight = configEntry{
 	bindEnv:      true,
 	bindFlag:     true,
 	defaultValue: 0.5,
-	usage:        "This weight is used to adjust the impact of the scaleFactor during capacity planning in linear mode.",
+	usage: "This weight is used to adjust the impact of the scaleFactor during capacity\n" +
+		"planning in linear mode.",
 }
 
 // ###################### Context: Logging ################################################
@@ -174,7 +242,8 @@ var saaAlertExpirationTime = configEntry{
 	bindEnv:      true,
 	bindFlag:     true,
 	defaultValue: time.Minute * 10,
-	usage:        "Defines after which time an alert will be pruned if he did not get updated again by the ScaleAlertEmitter, assuming that the alert is not relevant any more.",
+	usage: "Defines after which time an alert will be pruned if he did not get updated\n" +
+		"again by the ScaleAlertEmitter, assuming that the alert is not relevant any more.",
 }
 
 var saaNoAlertDamping = configEntry{
@@ -182,7 +251,8 @@ var saaNoAlertDamping = configEntry{
 	bindEnv:      true,
 	bindFlag:     true,
 	defaultValue: 1.0,
-	usage:        "Damping used in case there are currently no alerts firing (neither down- nor upscaling).",
+	usage: "Damping used in case there are currently no alerts firing\n" +
+		"(neither down- nor upscaling).",
 }
 
 var saaUpThresh = configEntry{
@@ -205,7 +275,8 @@ var saaEvalCylce = configEntry{
 	bindEnv:      true,
 	bindFlag:     true,
 	defaultValue: time.Second * 1,
-	usage:        "Cycle/ frequency the ScaleAlertAggregator evaluates the weights of the currently firing alerts.",
+	usage: "Cycle/ frequency the ScaleAlertAggregator evaluates the weights of the\n" +
+		"currently firing alerts.",
 }
 
 var saaEvalPeriodFactor = configEntry{
@@ -213,7 +284,8 @@ var saaEvalPeriodFactor = configEntry{
 	bindEnv:      true,
 	bindFlag:     true,
 	defaultValue: 10,
-	usage:        "EvaluationPeriodFactor is used to calculate the evaluation period (evaluationPeriod = evaluationCycle * evaluationPeriodFactor)",
+	usage: "EvaluationPeriodFactor is used to calculate the evaluation period\n" +
+		"(evaluationPeriod = evaluationCycle * evaluationPeriodFactor)",
 }
 
 var saaCleanupCylce = configEntry{
@@ -239,6 +311,7 @@ var configEntries = []configEntry{
 	scaleObjectName,
 	scaleObjectMin,
 	scaleObjectMax,
+	capScaleSchedule,
 	capDownScaleCoolDown,
 	capUpScaleCoolDown,
 	loggingStructured,
@@ -252,11 +325,15 @@ var configEntries = []configEntry{
 	saaCleanupCylce,
 	saaScaleAlerts,
 	saaAlertExpirationTime,
+	scaMode,
+	scaWatcherInterval,
+	scaAWSEC2Profile,
+	scaAWSEC2Region,
+	scaAWSEC2ASGTagKey,
 	scaNomadDataCenterAWSProfile,
 	scaNomadDataCenterAWSRegion,
-	scaNomadMode,
+	scaNomadDataCenterAWSInstanceTerminationTimeout,
 	scaNomadModeServerAddress,
-	scaWatcherInterval,
 	capConstantModeEnable,
 	capConstantModeOffset,
 	capLinearModeEnable,

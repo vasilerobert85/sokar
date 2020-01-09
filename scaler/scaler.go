@@ -8,6 +8,8 @@ import (
 	"github.com/rs/zerolog"
 )
 
+var oneDayAgo = time.Now().Add(time.Hour * -24)
+
 // Scaler is a component responsible for scaling a scalingObject
 type Scaler struct {
 	logger zerolog.Logger
@@ -16,8 +18,17 @@ type Scaler struct {
 	// the system that shall be used for scaling (i.e nomad)
 	scalingTarget ScalingTarget
 
-	// scalingObjectCfg is the configuration for the scalingObject
-	scalingObjectCfg scalingObjectConfig
+	// ScalingObject represents the ScalingObject and relevant meta data
+	scalingObject ScalingObject
+
+	// dryRunMode active/ not active. In dry run mode no automatic scaling will
+	// executed. For more information see ../doc/DryRunMode.md
+	dryRunMode bool
+
+	// LastScaleAction represents that point in time
+	// when the scaler was triggered to execute a scaling
+	// action the last time
+	lastScaleAction time.Time
 
 	// watcherInterval the interval the Scaler will check if
 	// the scalingObject count still matches the desired state.
@@ -43,63 +54,93 @@ type Scaler struct {
 	metrics Metrics
 
 	wg sync.WaitGroup
+
+	// scalingObjectWatcherPaused if true the scaling object won't be tracked to check if there is an adjustment needed
+	scalingObjectWatcherPaused bool
 }
 
-// Config is the configuration for the Scaler
-type Config struct {
-	Name                  string
-	MinCount              uint
-	MaxCount              uint
-	Logger                zerolog.Logger
-	MaxOpenScalingTickets uint
-	WatcherInterval       time.Duration
+// Option represents an option for the Scaler
+type Option func(c *Scaler)
+
+// WithLogger adds a configured Logger to the Scaler
+func WithLogger(logger zerolog.Logger) Option {
+	return func(s *Scaler) {
+		s.logger = logger
+	}
 }
 
-// scalingObjectConfig config of the scalingObject to be scaled
-type scalingObjectConfig struct {
-	name     string
-	minCount uint
-	maxCount uint
+// MaxOpenScalingTickets specifies how many scaling tickets can be open at the same time
+func MaxOpenScalingTickets(num uint) Option {
+	return func(s *Scaler) {
+		s.maxOpenScalingTickets = num
+	}
+}
+
+// WatcherInterval specifies the interval the scaleObjectWatcher will use to check if the scale still
+// matches the current expectation
+func WatcherInterval(interval time.Duration) Option {
+	return func(s *Scaler) {
+		s.watcherInterval = interval
+	}
+}
+
+// DryRunMode can be used to activate/ deactivate the dry run mode.
+// In dry run mode no automatic scaling will executed.
+// For more information see ../doc/DryRunMode.md
+func DryRunMode(enable bool) Option {
+	return func(s *Scaler) {
+		s.dryRunMode = enable
+	}
 }
 
 // New creates a new instance of a scaler using the given
 // ScalingTarget to send scaling events to.
-func (cfg Config) New(scalingTarget ScalingTarget, metrics Metrics) (*Scaler, error) {
-	if scalingTarget == nil {
-		return nil, fmt.Errorf("Given ScalingTarget is nil")
-	}
+func New(scalingTarget ScalingTarget, scalingObject ScalingObject, metrics Metrics, options ...Option) (*Scaler, error) {
 
-	if cfg.WatcherInterval <= time.Second*0 {
-		return nil, fmt.Errorf("WatcherInterval is %s which is a too small value and thus not supported", cfg.WatcherInterval.String())
-	}
-
-	return &Scaler{
-		logger:          cfg.Logger,
-		scalingTarget:   scalingTarget,
-		watcherInterval: cfg.WatcherInterval,
-		scalingObjectCfg: scalingObjectConfig{
-			name:     cfg.Name,
-			minCount: cfg.MinCount,
-			maxCount: cfg.MaxCount,
-		},
+	maxOpenScalingTickets := uint(0)
+	scaler := Scaler{
+		scalingTarget:         scalingTarget,
+		watcherInterval:       time.Second * 5,
+		scalingObject:         scalingObject,
 		stopChan:              make(chan struct{}, 1),
 		numOpenScalingTickets: 0,
-		maxOpenScalingTickets: cfg.MaxOpenScalingTickets,
-		scaleTicketChan:       make(chan ScalingTicket, cfg.MaxOpenScalingTickets+1),
+		maxOpenScalingTickets: maxOpenScalingTickets,
 		metrics:               metrics,
 		desiredScale:          optionalValue{isKnown: false},
-	}, nil
+		dryRunMode:            false,
+		lastScaleAction:       oneDayAgo,
+	}
+
+	// apply the options
+	for _, opt := range options {
+		opt(&scaler)
+	}
+
+	scaler.scaleTicketChan = make(chan ScalingTicket, scaler.maxOpenScalingTickets+1)
+
+	if scaler.scalingTarget == nil {
+		return nil, fmt.Errorf("Given ScalingTarget is nil")
+	}
+	if scaler.scaleTicketChan == nil {
+		return nil, fmt.Errorf("Scaling Ticket Channel is nil")
+	}
+
+	if scaler.watcherInterval <= time.Second*0 {
+		return nil, fmt.Errorf("WatcherInterval is %s which is a too small value and thus not supported", scaler.watcherInterval.String())
+	}
+
+	return &scaler, nil
 }
 
 // GetCount returns the number of currently deployed instances
 func (s *Scaler) GetCount() (uint, error) {
-	return s.scalingTarget.GetScalingObjectCount(s.scalingObjectCfg.name)
+	return s.scalingTarget.GetScalingObjectCount(s.scalingObject.Name)
 }
 
 // ScaleTo will scale the scalingObject to the desired count.
-func (s *Scaler) ScaleTo(desiredCount uint, dryRun bool) error {
-	s.logger.Info().Msgf("Scale to %d requested (dryRun=%t).", desiredCount, dryRun)
-	return s.openScalingTicket(desiredCount, dryRun)
+func (s *Scaler) ScaleTo(desiredCount uint, force bool) error {
+	s.logger.Info().Msgf("Scale to %d requested (force=%t).", desiredCount, force)
+	return s.openScalingTicket(desiredCount, force)
 }
 
 // GetName returns the name of this component
@@ -111,19 +152,33 @@ func (s *Scaler) GetName() string {
 func (s *Scaler) Run() {
 	// handler that processes incoming scaling tickets
 	go s.scaleTicketProcessor(s.scaleTicketChan)
-	// handler that checks periodically if the desired count is still valid
-	go s.scalingObjectWatcher(s.watcherInterval)
+
+	if s.dryRunMode {
+		s.logger.Info().Msg("Don't start the ScalingObjectWatcher in dry-run mode.")
+	} else {
+		// handler that checks periodically if the desired count is still valid
+		go s.scalingObjectWatcher(s.watcherInterval)
+		s.logger.Info().Msg("ScalingObjectWatcher started.")
+	}
 }
 
 // Stop tears down scaler
-func (s *Scaler) Stop() {
+func (s *Scaler) Stop() error {
 	s.logger.Info().Msg("Teardown requested")
 
 	close(s.scaleTicketChan)
 	close(s.stopChan)
+
+	return nil
 }
 
 // Join blocks/ waits until scaler has been stopped
 func (s *Scaler) Join() {
 	s.wg.Wait()
+}
+
+// GetTimeOfLastScaleAction returns that point in time where the most recent
+// scaling STARTED.
+func (s *Scaler) GetTimeOfLastScaleAction() time.Time {
+	return s.lastScaleAction
 }
